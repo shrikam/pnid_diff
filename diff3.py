@@ -161,7 +161,6 @@ class PIDEquipmentRecognizer:
                 'circularity': round(circularity, 2),
                 'perimeter': round(perimeter, 2),
                 'bounding_box': (x, y, w, h),
-                'position': (x + w//2, y + h//2),  # Center position
                 'safety_level': safety_level,
                 'description': description,
                 'confidence': self._calculate_confidence(equipment_type, vertices, aspect_ratio, area, solidity, circularity)
@@ -326,7 +325,6 @@ class PIDPipelineDetector:
                             'pipe_id': f'PIPE_{i+1}',
                             'start_point': (x1, y1),
                             'end_point': (x2, y2),
-                            'position': ((x1+x2)//2, (y1+y2)//2),
                             'length': round(length, 2),
                             'angle': round(angle, 2),
                             'pipe_type': self._classify_pipe_type(angle, length),
@@ -348,7 +346,6 @@ class PIDPipelineDetector:
                     pipe_element = {
                         'pipe_id': f'PIPE_CONTOUR_{i+1}',
                         'bounding_box': (x, y, w, h),
-                        'position': (x + w//2, y + h//2),
                         'area': area,
                         'aspect_ratio': round(aspect_ratio, 2),
                         'pipe_type': 'process_pipe',
@@ -398,7 +395,7 @@ class PIDPipelineDetector:
 
 class EnhancedPIDDifferenceAnalyzer:
     """
-    Enhanced P&ID difference analyzer with specific equipment recognition and missing/additional tracking
+    Enhanced P&ID difference analyzer with specific equipment recognition
     """
     
     def __init__(self, sensitivity: float = 30.0, min_area: int = 100):
@@ -410,27 +407,185 @@ class EnhancedPIDDifferenceAnalyzer:
     def analyze_equipment_differences(self, img1: np.ndarray, img2: np.ndarray,
                                     img1_path: str = "Image 1", img2_path: str = "Image 2") -> Dict[str, Any]:
         """
-        Enhanced difference analysis with specific P&ID equipment recognition and missing/additional detection
+        Enhanced difference analysis with specific P&ID equipment recognition
         """
         try:
             logger.info("Starting enhanced P&ID equipment difference analysis")
             
-            # Step 1: Extract equipment from both images separately
-            equipment_img1 = self._extract_equipment_from_image(img1)
-            equipment_img2 = self._extract_equipment_from_image(img2)
+            # Ensure images are the same size
+            if img1.shape != img2.shape:
+                img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+                logger.warning("Images resized to match dimensions")
             
-            # Step 2: Perform difference analysis
-            difference_analysis = self._perform_difference_analysis(img1, img2)
+            # Convert to grayscale for analysis
+            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
+            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
             
-            # Step 3: Identify missing and additional equipment
-            missing_additional = self._compute_missing_additional_equipment(equipment_img1, equipment_img2)
+            # Calculate absolute difference
+            diff = cv2.absdiff(gray1, gray2)
             
-            # Combine all results
+            # Apply threshold to create binary difference image
+            _, thresh = cv2.threshold(diff, self.sensitivity, 255, cv2.THRESH_BINARY)
+            
+            # Enhanced morphological operations for P&ID equipment
+            kernel = np.ones((5, 5), np.uint8)
+            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+            
+            # Dilate to merge nearby differences (equipment parts)
+            dilate_kernel = np.ones((7, 7), np.uint8)
+            dilated = cv2.dilate(cleaned, dilate_kernel, iterations=2)
+            
+            # Find contours of differences
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter contours by area
+            valid_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= self.min_area]
+            
+            # Create marked image (copy of img2)
+            marked_img = img2.copy()
+            
+            # Analyze each difference region with equipment recognition
+            equipment_differences = []
+            pipe_differences = []
+            instrument_differences = []
+            
+            total_diff_area = 0
+            equipment_statistics = {}
+            safety_statistics = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+            
+            # Detect pipes separately using line detection
+            detected_pipes = self.pipe_detector.detect_pipes(img2, valid_contours)
+            
+            for i, contour in enumerate(valid_contours):
+                # Basic contour properties
+                x, y, w, h = cv2.boundingRect(contour)
+                area = cv2.contourArea(contour)
+                total_diff_area += area
+                
+                # Recognize equipment type
+                equipment_info = self.equipment_recognizer.recognize_equipment(contour, img2)
+                
+                if equipment_info:
+                    equipment_type = equipment_info['equipment_type']
+                    safety_level = equipment_info['safety_level']
+                    confidence = equipment_info['confidence']
+                    
+                    # Update statistics
+                    equipment_statistics[equipment_type] = equipment_statistics.get(equipment_type, 0) + 1
+                    safety_statistics[safety_level] += 1
+                    
+                    # Choose color based on equipment type
+                    color = self.equipment_recognizer.equipment_colors.get(equipment_type, 
+                                                                          self.equipment_recognizer.equipment_colors['unknown'])
+                    
+                    # Line thickness based on safety level
+                    line_thickness = 5 if safety_level == 'CRITICAL' else 4 if safety_level == 'HIGH' else 3
+                    
+                    # Draw enhanced marking with equipment-specific styling
+                    cv2.rectangle(marked_img, (x, y), (x+w, y+h), color, line_thickness)
+                    
+                    # Add comprehensive labeling
+                    label_lines = [
+                        f"D{i+1}: {equipment_type.upper()}",
+                        f"SAFETY: {safety_level}",
+                        f"CONF: {confidence:.2f}"
+                    ]
+                    
+                    # Draw labels with backgrounds
+                    label_y_start = max(y - 60, 10)
+                    for idx, label in enumerate(label_lines):
+                        label_y = label_y_start + (idx * 18)
+                        if label_y > 10:
+                            # Background rectangle for text visibility
+                            (text_width, text_height), _ = cv2.getTextSize(
+                                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                            )
+                            cv2.rectangle(marked_img, 
+                                        (x, label_y - text_height - 2),
+                                        (x + text_width + 4, label_y + 2),
+                                        (255, 255, 255), -1)
+                            
+                            # Draw text
+                            cv2.putText(marked_img, label, (x + 2, label_y), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    
+                    # Create comprehensive difference record
+                    diff_record = {
+                        'Difference_ID': i + 1,
+                        'Equipment_Type': equipment_type,
+                        'Safety_Level': safety_level,
+                        'Confidence_Score': round(confidence, 3),
+                        'X_Coordinate': int(x),
+                        'Y_Coordinate': int(y),
+                        'Width': int(w),
+                        'Height': int(h),
+                        'Area_Pixels': int(area),
+                        'Aspect_Ratio': equipment_info['aspect_ratio'],
+                        'Solidity': equipment_info['solidity'],
+                        'Circularity': equipment_info['circularity'],
+                        'Vertices': equipment_info['vertices'],
+                        'Perimeter': equipment_info['perimeter'],
+                        'Bounding_Box': f"({x},{y})-({x+w},{y+h})",
+                        'Description': equipment_info['description'],
+                        'Percentage_of_Image': round((area / (img1.shape[0] * img1.shape[1])) * 100, 4)
+                    }
+                    
+                    # Categorize by equipment type
+                    if equipment_type == 'pipe':
+                        pipe_differences.append(diff_record)
+                    elif equipment_type == 'instrument':
+                        instrument_differences.append(diff_record)
+                    else:
+                        equipment_differences.append(diff_record)
+                
+                else:
+                    # Fallback for unrecognized equipment
+                    color = self.equipment_recognizer.equipment_colors['unknown']
+                    cv2.rectangle(marked_img, (x, y), (x+w, y+h), color, 2)
+                    cv2.putText(marked_img, f"D{i+1}: UNKNOWN", (x, y-10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    
+                    diff_record = {
+                        'Difference_ID': i + 1,
+                        'Equipment_Type': 'unknown',
+                        'Safety_Level': 'LOW',
+                        'Confidence_Score': 0.0,
+                        'X_Coordinate': int(x),
+                        'Y_Coordinate': int(y),
+                        'Width': int(w),
+                        'Height': int(h),
+                        'Area_Pixels': int(area),
+                        'Aspect_Ratio': float(w) / h if h > 0 else 0,
+                        'Solidity': 0,
+                        'Circularity': 0,
+                        'Vertices': 0,
+                        'Perimeter': 0,
+                        'Bounding_Box': f"({x},{y})-({x+w},{y+h})",
+                        'Description': 'Unrecognized equipment',
+                        'Percentage_of_Image': round((area / (img1.shape[0] * img1.shape[1])) * 100, 4)
+                    }
+                    
+                    equipment_differences.append(diff_record)
+            
+            # Add detected pipes to the analysis
+            for pipe_info in detected_pipes:
+                if 'bounding_box' in pipe_info:
+                    x, y, w, h = pipe_info['bounding_box']
+                    color = self.equipment_recognizer.equipment_colors['pipe']
+                    cv2.rectangle(marked_img, (x, y), (x+w, y+h), color, 3)
+                    cv2.putText(marked_img, "PIPE", (x, y-10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # Calculate overall statistics
+            total_pixels = img1.shape[0] * img1.shape[1]
+            diff_percentage = (total_diff_area / total_pixels) * 100
+            
+            # Combine all differences
+            all_differences = equipment_differences + pipe_differences + instrument_differences
+            
+            # Create comprehensive analysis results
             analysis_results = {
-                **difference_analysis,
-                'missing_additional_analysis': missing_additional,
-                'equipment_img1': equipment_img1,
-                'equipment_img2': equipment_img2,
                 'metadata': {
                     'analysis_timestamp': datetime.now().isoformat(),
                     'image1_path': img1_path,
@@ -439,504 +594,472 @@ class EnhancedPIDDifferenceAnalyzer:
                     'sensitivity_threshold': self.sensitivity,
                     'minimum_area_threshold': self.min_area,
                     'equipment_recognition_enabled': True
-                }
+                },
+                'summary_statistics': {
+                    'total_differences_found': len(all_differences),
+                    'equipment_differences': len(equipment_differences),
+                    'pipe_differences': len(pipe_differences),
+                    'instrument_differences': len(instrument_differences),
+                    'total_difference_area': int(total_diff_area),
+                    'percentage_changed': round(diff_percentage, 4),
+                    'critical_differences': safety_statistics['CRITICAL'],
+                    'high_severity_differences': safety_statistics['HIGH'],
+                    'medium_severity_differences': safety_statistics['MEDIUM'],
+                    'low_severity_differences': safety_statistics['LOW']
+                },
+                'equipment_statistics': equipment_statistics,
+                'safety_statistics': safety_statistics,
+                'equipment_differences': equipment_differences,
+                'pipe_differences': pipe_differences,
+                'instrument_differences': instrument_differences,
+                'all_differences': all_differences,
+                'detected_pipes': detected_pipes,
+                'marked_image': marked_img,
+                'difference_mask': thresh,
+                'raw_difference': diff
             }
             
-            logger.info("Enhanced analysis completed with missing/additional equipment tracking")
+            logger.info(f"Equipment analysis completed: {len(all_differences)} differences found")
+            logger.info(f"Equipment distribution: {equipment_statistics}")
+            logger.info(f"Safety distribution: {safety_statistics}")
+            
             return analysis_results
             
         except Exception as e:
             logger.error(f"Error in enhanced equipment difference analysis: {str(e)}")
             raise
-    
-    def _extract_equipment_from_image(self, img: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Extract all equipment from a single image
-        """
-        try:
-            # Convert to grayscale
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-            
-            # Apply thresholding to find all objects
-            _, thresh = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
-            
-            # Morphological operations
-            kernel = np.ones((3, 3), np.uint8)
-            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-            
-            # Find contours
-            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Filter and recognize equipment
-            equipment_list = []
-            for i, contour in enumerate(contours):
-                if cv2.contourArea(contour) >= self.min_area:
-                    equipment_info = self.equipment_recognizer.recognize_equipment(contour, img)
-                    if equipment_info:
-                        equipment_info['symbol_id'] = f"EQ_{i+1}"
-                        equipment_list.append(equipment_info)
-            
-            # Also detect pipes
-            detected_pipes = self.pipe_detector.detect_pipes(img, contours)
-            for pipe in detected_pipes:
-                pipe['symbol_id'] = pipe['pipe_id']
-                equipment_list.append(pipe)
-            
-            return equipment_list
-            
-        except Exception as e:
-            logger.warning(f"Error extracting equipment from image: {str(e)}")
-            return []
-    
-    def _perform_difference_analysis(self, img1: np.ndarray, img2: np.ndarray) -> Dict[str, Any]:
-        """
-        Perform standard difference analysis
-        """
-        # Ensure images are the same size
-        if img1.shape != img2.shape:
-            img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-        
-        # Convert to grayscale for analysis
-        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
-        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
-        
-        # Calculate absolute difference
-        diff = cv2.absdiff(gray1, gray2)
-        
-        # Apply threshold
-        _, thresh = cv2.threshold(diff, self.sensitivity, 255, cv2.THRESH_BINARY)
-        
-        # Morphological operations
-        kernel = np.ones((5, 5), np.uint8)
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-        dilated = cv2.dilate(cleaned, np.ones((7, 7), np.uint8), iterations=2)
-        
-        # Find contours
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= self.min_area]
-        
-        # Create marked image
-        marked_img = img2.copy()
-        
-        # Analyze differences
-        difference_regions = []
-        equipment_statistics = {}
-        safety_statistics = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
-        
-        for i, contour in enumerate(valid_contours):
-            x, y, w, h = cv2.boundingRect(contour)
-            area = cv2.contourArea(contour)
-            
-            # Recognize equipment in difference region
-            equipment_info = self.equipment_recognizer.recognize_equipment(contour, img2)
-            
-            if equipment_info:
-                equipment_type = equipment_info['equipment_type']
-                safety_level = equipment_info['safety_level']
-                
-                equipment_statistics[equipment_type] = equipment_statistics.get(equipment_type, 0) + 1
-                safety_statistics[safety_level] += 1
-                
-                # Draw marking
-                color = self.equipment_recognizer.equipment_colors.get(equipment_type, (128, 128, 128))
-                thickness = 5 if safety_level == 'CRITICAL' else 4 if safety_level == 'HIGH' else 3
-                
-                cv2.rectangle(marked_img, (x, y), (x+w, y+h), color, thickness)
-                
-                # Add labels
-                labels = [
-                    f"D{i+1}: {equipment_type.upper()}",
-                    f"SAFETY: {safety_level}",
-                    f"CONF: {equipment_info['confidence']:.2f}"
-                ]
-                
-                label_y_start = max(y - 60, 10)
-                for idx, label in enumerate(labels):
-                    label_y = label_y_start + (idx * 18)
-                    if label_y > 10:
-                        (text_width, text_height), _ = cv2.getTextSize(
-                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-                        )
-                        cv2.rectangle(marked_img, 
-                                    (x, label_y - text_height - 2),
-                                    (x + text_width + 4, label_y + 2),
-                                    (255, 255, 255), -1)
-                        cv2.putText(marked_img, label, (x + 2, label_y), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                
-                difference_regions.append({
-                    'Difference_ID': i + 1,
-                    'Equipment_Type': equipment_type,
-                    'Safety_Level': safety_level,
-                    'Confidence_Score': equipment_info['confidence'],
-                    'Position': equipment_info['position'],
-                    'Area': area,
-                    'Bounding_Box': (x, y, w, h)
-                })
-        
-        return {
-            'difference_regions': difference_regions,
-            'marked_image': marked_img,
-            'difference_mask': thresh,
-            'raw_difference': diff,
-            'equipment_statistics': equipment_statistics,
-            'safety_statistics': safety_statistics
-        }
-    
-    def _compute_missing_additional_equipment(self, equipment_img1: List[Dict[str, Any]], 
-                                            equipment_img2: List[Dict[str, Any]], 
-                                            distance_threshold: float = 50.0) -> Dict[str, Any]:
-        """
-        Enhanced function to identify missing and additional equipment with detailed tracking
-        """
-        def is_position_match(pos1, pos2, threshold):
-            """Check if two positions are within threshold distance"""
-            return np.linalg.norm(np.array(pos1) - np.array(pos2)) < threshold
-        
-        def is_equipment_match(item1, item2, distance_threshold):
-            """Check if two equipment items match based on position and type"""
-            pos1 = item1.get('position', None)
-            pos2 = item2.get('position', None)
-            type1 = item1.get('equipment_type', 'unknown')
-            type2 = item2.get('equipment_type', 'unknown')
-            
-            if pos1 is None or pos2 is None:
-                return False
-            
-            return (type1 == type2 and 
-                    is_position_match(pos1, pos2, distance_threshold))
-        
-        missing_equipment = []  # Present in img1 but not in img2
-        additional_equipment = []  # Present in img2 but not in img1
-        missing_pipes = []
-        additional_pipes = []
-        matched_img2_indices = set()
-        
-        # Separate equipment and pipes
-        equipment_only_img1 = [eq for eq in equipment_img1 if eq.get('equipment_type') != 'pipe']
-        pipes_only_img1 = [eq for eq in equipment_img1 if eq.get('equipment_type') == 'pipe']
-        equipment_only_img2 = [eq for eq in equipment_img2 if eq.get('equipment_type') != 'pipe']
-        pipes_only_img2 = [eq for eq in equipment_img2 if eq.get('equipment_type') == 'pipe']
-        
-        # Find missing equipment (img1 -> img2)
-        for idx1, item1 in enumerate(equipment_only_img1):
-            found_match = False
-            for idx2, item2 in enumerate(equipment_only_img2):
-                if idx2 in matched_img2_indices:
-                    continue
-                if is_equipment_match(item1, item2, distance_threshold):
-                    found_match = True
-                    matched_img2_indices.add(idx2)
-                    break
-            
-            if not found_match:
-                missing_item = {
-                    'equipment_id': item1.get('symbol_id', f"MISSING_{idx1}"),
-                    'equipment_type': item1.get('equipment_type', 'unknown'),
-                    'position': item1.get('position', (0, 0)),
-                    'description': item1.get('description', 'Equipment not found in updated P&ID'),
-                    'safety_level': item1.get('safety_level', 'UNKNOWN'),
-                    'bounding_box': item1.get('bounding_box', None),
-                    'area': item1.get('area', 0),
-                    'status': 'MISSING'
-                }
-                missing_equipment.append(missing_item)
-        
-        # Find additional equipment (img2 -> img1)
-        for idx2, item2 in enumerate(equipment_only_img2):
-            if idx2 not in matched_img2_indices:
-                additional_item = {
-                    'equipment_id': item2.get('symbol_id', f"ADDITIONAL_{idx2}"),
-                    'equipment_type': item2.get('equipment_type', 'unknown'),
-                    'position': item2.get('position', (0, 0)),
-                    'description': item2.get('description', 'New equipment found in updated P&ID'),
-                    'safety_level': item2.get('safety_level', 'UNKNOWN'),
-                    'bounding_box': item2.get('bounding_box', None),
-                    'area': item2.get('area', 0),
-                    'status': 'ADDITIONAL'
-                }
-                additional_equipment.append(additional_item)
-        
-        # Similar analysis for pipes
-        matched_pipe_indices = set()
-        
-        # Find missing pipes
-        for idx1, pipe1 in enumerate(pipes_only_img1):
-            found_match = False
-            for idx2, pipe2 in enumerate(pipes_only_img2):
-                if idx2 in matched_pipe_indices:
-                    continue
-                if is_equipment_match(pipe1, pipe2, distance_threshold):
-                    found_match = True
-                    matched_pipe_indices.add(idx2)
-                    break
-            
-            if not found_match:
-                missing_pipes.append({
-                    'pipe_id': pipe1.get('symbol_id', f"MISSING_PIPE_{idx1}"),
-                    'pipe_type': pipe1.get('pipe_type', 'unknown'),
-                    'position': pipe1.get('position', (0, 0)),
-                    'length': pipe1.get('length', 0),
-                    'status': 'MISSING'
-                })
-        
-        # Find additional pipes
-        for idx2, pipe2 in enumerate(pipes_only_img2):
-            if idx2 not in matched_pipe_indices:
-                additional_pipes.append({
-                    'pipe_id': pipe2.get('symbol_id', f"ADDITIONAL_PIPE_{idx2}"),
-                    'pipe_type': pipe2.get('pipe_type', 'unknown'),
-                    'position': pipe2.get('position', (0, 0)),
-                    'length': pipe2.get('length', 0),
-                    'status': 'ADDITIONAL'
-                })
-        
-        return {
-            'missing_equipment': missing_equipment,
-            'additional_equipment': additional_equipment,
-            'missing_pipes': missing_pipes,
-            'additional_pipes': additional_pipes,
-            'equipment_missing_count': len(missing_equipment),
-            'equipment_additional_count': len(additional_equipment),
-            'pipes_missing_count': len(missing_pipes),
-            'pipes_additional_count': len(additional_pipes),
-            'total_changes': len(missing_equipment) + len(additional_equipment) + len(missing_pipes) + len(additional_pipes)
-        }
 
-def generate_enhanced_missing_additional_report(analysis_results: Dict[str, Any]) -> str:
+# Enhanced visualization functions for equipment types
+def create_equipment_visualizations(analysis_results: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generate comprehensive report including missing and additional equipment/pipes
-    """
-    missing_additional = analysis_results.get('missing_additional_analysis', {})
-    metadata = analysis_results.get('metadata', {})
-    
-    report = f"""
-P&ID EQUIPMENT CHANGE ANALYSIS REPORT
-{'='*50}
-
-ANALYSIS METADATA:
-- Analysis Date: {metadata.get('analysis_timestamp', 'Unknown')}
-- Reference P&ID: {metadata.get('image1_path', 'Unknown')}
-- Updated P&ID: {metadata.get('image2_path', 'Unknown')}
-- Equipment Recognition: Enabled
-- Total Equipment Changes: {missing_additional.get('total_changes', 0)}
-
-EQUIPMENT CHANGES SUMMARY:
-- Missing Equipment (Removed): {missing_additional.get('equipment_missing_count', 0)}
-- Additional Equipment (Added): {missing_additional.get('equipment_additional_count', 0)}
-- Missing Pipes (Removed): {missing_additional.get('pipes_missing_count', 0)}
-- Additional Pipes (Added): {missing_additional.get('pipes_additional_count', 0)}
-
-DETAILED MISSING EQUIPMENT LIST:
-{'='*35}
-"""
-    
-    missing_equipment = missing_additional.get('missing_equipment', [])
-    if missing_equipment:
-        for i, equipment in enumerate(missing_equipment, 1):
-            report += f"""
-{i}. MISSING EQUIPMENT:
-   ├── ID: {equipment['equipment_id']}
-   ├── Type: {equipment['equipment_type'].upper()}
-   ├── Position: {equipment['position']}
-   ├── Safety Level: {equipment['safety_level']}
-   ├── Area: {equipment['area']} pixels
-   └── Impact: Equipment removed from updated P&ID
-"""
-    else:
-        report += "\nNo missing equipment detected.\n"
-    
-    report += f"""
-
-DETAILED ADDITIONAL EQUIPMENT LIST:
-{'='*37}
-"""
-    
-    additional_equipment = missing_additional.get('additional_equipment', [])
-    if additional_equipment:
-        for i, equipment in enumerate(additional_equipment, 1):
-            report += f"""
-{i}. ADDITIONAL EQUIPMENT:
-   ├── ID: {equipment['equipment_id']}
-   ├── Type: {equipment['equipment_type'].upper()}
-   ├── Position: {equipment['position']}
-   ├── Safety Level: {equipment['safety_level']}
-   ├── Area: {equipment['area']} pixels
-   └── Impact: New equipment added in updated P&ID
-"""
-    else:
-        report += "\nNo additional equipment detected.\n"
-    
-    report += f"""
-
-DETAILED MISSING PIPES LIST:
-{'='*30}
-"""
-    
-    missing_pipes = missing_additional.get('missing_pipes', [])
-    if missing_pipes:
-        for i, pipe in enumerate(missing_pipes, 1):
-            report += f"""
-{i}. MISSING PIPE:
-   ├── ID: {pipe['pipe_id']}
-   ├── Type: {pipe['pipe_type']}
-   ├── Position: {pipe['position']}
-   ├── Length: {pipe.get('length', 'Unknown')} pixels
-   └── Impact: Piping connection removed
-"""
-    else:
-        report += "\nNo missing pipes detected.\n"
-    
-    report += f"""
-
-DETAILED ADDITIONAL PIPES LIST:
-{'='*32}
-"""
-    
-    additional_pipes = missing_additional.get('additional_pipes', [])
-    if additional_pipes:
-        for i, pipe in enumerate(additional_pipes, 1):
-            report += f"""
-{i}. ADDITIONAL PIPE:
-   ├── ID: {pipe['pipe_id']}
-   ├── Type: {pipe['pipe_type']}
-   ├── Position: {pipe['position']}
-   ├── Length: {pipe.get('length', 'Unknown')} pixels
-   └── Impact: New piping connection added
-"""
-    else:
-        report += "\nNo additional pipes detected.\n"
-    
-    # Safety impact assessment
-    missing_critical = len([eq for eq in missing_equipment if eq['safety_level'] == 'CRITICAL'])
-    additional_critical = len([eq for eq in additional_equipment if eq['safety_level'] == 'CRITICAL'])
-    
-    report += f"""
-
-SAFETY IMPACT ASSESSMENT:
-{'='*27}
-- Critical Equipment Removed: {missing_critical}
-- Critical Equipment Added: {additional_critical}
-- Total Safety-Critical Changes: {missing_critical + additional_critical}
-
-RECOMMENDATIONS:
-{'='*15}
-1. MISSING EQUIPMENT REVIEW:
-   - Verify removal authorization for all missing equipment
-   - Ensure proper isolation and lockout procedures completed
-   - Update operating procedures to reflect equipment removal
-   - Consider impact on process capacity and safety systems
-
-2. ADDITIONAL EQUIPMENT REVIEW:
-   - Verify installation specifications for new equipment
-   - Confirm commissioning procedures completed
-   - Update equipment database and maintenance schedules
-   - Ensure operator training on new equipment functionality
-
-3. PIPING CHANGES REVIEW:
-   - Verify piping modifications follow approved designs
-   - Confirm pressure testing and leak detection completed
-   - Update piping isometrics and stress analysis
-   - Ensure material compatibility and code compliance
-
-4. DOCUMENTATION UPDATES:
-   - Update P&ID revision numbers and change logs
-   - Revise operating procedures and emergency responses
-   - Update equipment lists and spare parts inventory
-   - Complete Management of Change (MOC) documentation
-
-Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Analysis Tool: Enhanced P&ID Equipment Difference Analyzer
-For Industrial Safety Applications
-"""
-    
-    return report
-
-def create_enhanced_csv_with_missing_additional(analysis_results: Dict[str, Any]) -> bytes:
-    """
-    Create comprehensive CSV including missing and additional equipment/pipes
+    Create enhanced visualizations for P&ID equipment analysis
     """
     try:
-        # Extract missing/additional data
-        missing_additional = analysis_results.get('missing_additional_analysis', {})
+        equipment_stats = analysis_results.get('equipment_statistics', {})
+        safety_stats = analysis_results.get('safety_statistics', {})
+        all_differences = analysis_results.get('all_differences', [])
         
-        # Create comprehensive datasets
-        all_changes = []
+        visualizations = {}
         
-        # Add missing equipment
-        for equipment in missing_additional.get('missing_equipment', []):
-            all_changes.append({
-                'Change_Type': 'MISSING_EQUIPMENT',
-                'Equipment_ID': equipment['equipment_id'],
-                'Equipment_Type': equipment['equipment_type'],
-                'Position_X': equipment['position'][0],
-                'Position_Y': equipment['position'][1],
-                'Safety_Level': equipment['safety_level'],
-                'Area_Pixels': equipment['area'],
-                'Description': equipment['description'],
-                'Impact': 'Equipment removed from updated P&ID'
-            })
+        if all_differences:
+            # Equipment distribution pie chart
+            if equipment_stats:
+                equipment_fig = px.pie(
+                    values=list(equipment_stats.values()),
+                    names=list(equipment_stats.keys()),
+                    title="P&ID Equipment Types in Differences",
+                    color_discrete_map={
+                        'pump': '#FF6400',
+                        'drum': '#00C800',
+                        'vessel': '#0096FF',
+                        'heat_exchanger': '#FFC800',
+                        'valve': '#FF0000',
+                        'instrument': '#FF00FF',
+                        'pipe': '#00FFFF'
+                    }
+                )
+                visualizations['equipment_pie'] = equipment_fig
+            
+            # Safety level analysis
+            safety_counts = {k: v for k, v in safety_stats.items() if v > 0}
+            if safety_counts:
+                safety_fig = px.pie(
+                    values=list(safety_counts.values()),
+                    names=list(safety_counts.keys()),
+                    title="Safety Level Distribution",
+                    color_discrete_map={
+                        'CRITICAL': '#FF0000',
+                        'HIGH': '#FF4500',
+                        'MEDIUM': '#FFFF00',
+                        'LOW': '#00FF00'
+                    }
+                )
+                visualizations['safety_pie'] = safety_fig
+            
+            # Equipment vs Area scatter plot
+            df_diffs = pd.DataFrame(all_differences)
+            if not df_diffs.empty:
+                scatter_fig = px.scatter(
+                    df_diffs,
+                    x='Confidence_Score',
+                    y='Area_Pixels',
+                    color='Equipment_Type',
+                    size='Aspect_Ratio',
+                    symbol='Safety_Level',
+                    title="P&ID Equipment Analysis: Confidence vs Area",
+                    hover_data=['Description', 'Equipment_Type']
+                )
+                visualizations['equipment_scatter'] = scatter_fig
+                
+                # Equipment location map
+                location_fig = go.Figure()
+                
+                for eq_type in df_diffs['Equipment_Type'].unique():
+                    eq_data = df_diffs[df_diffs['Equipment_Type'] == eq_type]
+                    if not eq_data.empty:
+                        location_fig.add_trace(go.Scatter(
+                            x=eq_data['X_Coordinate'],
+                            y=eq_data['Y_Coordinate'],
+                            mode='markers',
+                            marker=dict(
+                                size=eq_data['Area_Pixels'] / 100,
+                                opacity=0.8,
+                                line=dict(width=2, color='DarkSlateGrey')
+                            ),
+                            name=f'{eq_type.title()}',
+                            text=eq_data['Equipment_Type'],
+                            hovertemplate='<b>%{text}</b><br>' +
+                                        'Location: (%{x}, %{y})<br>' +
+                                        'Safety: %{customdata}<br>' +
+                                        '<extra></extra>',
+                            customdata=eq_data['Safety_Level']
+                        ))
+                
+                location_fig.update_layout(
+                    title="P&ID Equipment Location Map",
+                    xaxis_title="X Coordinate (pixels)",
+                    yaxis_title="Y Coordinate (pixels)",
+                    yaxis=dict(autorange="reversed")
+                )
+                visualizations['equipment_location_map'] = location_fig
         
-        # Add additional equipment
-        for equipment in missing_additional.get('additional_equipment', []):
-            all_changes.append({
-                'Change_Type': 'ADDITIONAL_EQUIPMENT',
-                'Equipment_ID': equipment['equipment_id'],
-                'Equipment_Type': equipment['equipment_type'],
-                'Position_X': equipment['position'][0],
-                'Position_Y': equipment['position'][1],
-                'Safety_Level': equipment['safety_level'],
-                'Area_Pixels': equipment['area'],
-                'Description': equipment['description'],
-                'Impact': 'New equipment added in updated P&ID'
-            })
+        return visualizations
         
-        # Add missing pipes
-        for pipe in missing_additional.get('missing_pipes', []):
-            all_changes.append({
-                'Change_Type': 'MISSING_PIPE',
-                'Equipment_ID': pipe['pipe_id'],
-                'Equipment_Type': pipe['pipe_type'],
-                'Position_X': pipe['position'][0],
-                'Position_Y': pipe['position'][1],
-                'Safety_Level': 'MEDIUM',
-                'Area_Pixels': pipe.get('length', 0),
-                'Description': f"Pipe connection removed: {pipe['pipe_type']}",
-                'Impact': 'Piping connection removed from updated P&ID'
-            })
+    except Exception as e:
+        logger.error(f"Error creating equipment visualizations: {str(e)}")
+        return {}
+
+# Updated Streamlit Application
+def main():
+    st.set_page_config(
+        page_title="P&ID Equipment Difference Analyzer",
+        page_icon="🔧",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    st.title("🔧 P&ID Equipment Difference Analyzer")
+    st.markdown("**Industrial Safety Analysis with Specific Equipment Recognition: Pumps, Drums, Vessels, Pipes, Instruments**")
+    
+    # Enhanced sidebar with equipment information
+    st.sidebar.header("⚙️ Equipment Analysis Configuration")
+    
+    sensitivity = st.sidebar.slider(
+        "Difference Sensitivity Threshold", 
+        min_value=10.0, max_value=100.0, value=30.0, step=5.0,
+        help="Lower values detect smaller differences (more sensitive)"
+    )
+    min_area = st.sidebar.slider(
+        "Minimum Equipment Area (pixels)", 
+        min_value=50, max_value=1000, value=100, step=50,
+        help="Minimum area to consider as equipment"
+    )
+    
+    st.sidebar.markdown("### 🏭 Recognized Equipment Types")
+    equipment_legend = {
+        "🟠 Pumps": "Centrifugal and positive displacement pumps",
+        "🟢 Drums/Tanks": "Storage vessels and process drums",
+        "🔵 Vessels": "Process vessels, reactors, separators",
+        "🟡 Heat Exchangers": "Shell and tube heat transfer equipment",
+        "🔴 Valves": "Control and isolation valves (CRITICAL)",
+        "🟣 Instruments": "Process monitoring and control devices",
+        "🔷 Pipes": "Process piping and connections"
+    }
+    
+    for equipment, description in equipment_legend.items():
+        st.sidebar.markdown(f"**{equipment}**: {description}")
+    
+    st.sidebar.markdown("### 🚨 Safety Classification")
+    st.sidebar.markdown("- **CRITICAL**: Valves, safety systems")
+    st.sidebar.markdown("- **HIGH**: Pumps, vessels, instruments")
+    st.sidebar.markdown("- **MEDIUM**: Drums, heat exchangers, pipes")
+    st.sidebar.markdown("- **LOW**: General equipment")
+    
+    # File upload section
+    st.header("📁 Upload P&ID Images for Equipment Analysis")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📄 Reference P&ID (Image 1)")
+        uploaded_img1 = st.file_uploader(
+            "Choose reference P&ID image", 
+            type=['png', 'jpg', 'jpeg', 'tiff', 'bmp'],
+            key="img1"
+        )
         
-        # Add additional pipes
-        for pipe in missing_additional.get('additional_pipes', []):
-            all_changes.append({
-                'Change_Type': 'ADDITIONAL_PIPE',
-                'Equipment_ID': pipe['pipe_id'],
-                'Equipment_Type': pipe['pipe_type'],
-                'Position_X': pipe['position'][0],
-                'Position_Y': pipe['position'][1],
-                'Safety_Level': 'MEDIUM',
-                'Area_Pixels': pipe.get('length', 0),
-                'Description': f"New pipe connection added: {pipe['pipe_type']}",
-                'Impact': 'New piping connection added in updated P&ID'
-            })
+        if uploaded_img1:
+            image1 = Image.open(uploaded_img1)
+            st.image(image1, caption="Reference P&ID", use_container_width=True)
+    
+    with col2:
+        st.subheader("📄 Updated P&ID (Image 2)")
+        uploaded_img2 = st.file_uploader(
+            "Choose updated P&ID image", 
+            type=['png', 'jpg', 'jpeg', 'tiff', 'bmp'],
+            key="img2"
+        )
         
-        # Create DataFrame
-        df_changes = pd.DataFrame(all_changes)
+        if uploaded_img2:
+            image2 = Image.open(uploaded_img2)
+            st.image(image2, caption="Updated P&ID", use_container_width=True)
+    
+    # Equipment analysis section
+    if uploaded_img1 and uploaded_img2:
+        st.header("🔬 P&ID Equipment Difference Analysis")
         
-        # Add summary information
+        if st.button("🚀 Analyze Equipment Differences", type="primary"):
+            with st.spinner("Analyzing P&ID equipment differences... Recognizing pumps, drums, vessels, pipes, and instruments..."):
+                try:
+                    # Initialize equipment analyzer
+                    analyzer = EnhancedPIDDifferenceAnalyzer(
+                        sensitivity=sensitivity, 
+                        min_area=min_area
+                    )
+                    
+                    # Convert PIL images to numpy arrays
+                    img1_array = np.array(image1)
+                    img2_array = np.array(image2)
+                    
+                    # Ensure images are in BGR format for OpenCV
+                    if len(img1_array.shape) == 3:
+                        img1_array = cv2.cvtColor(img1_array, cv2.COLOR_RGB2BGR)
+                    if len(img2_array.shape) == 3:
+                        img2_array = cv2.cvtColor(img2_array, cv2.COLOR_RGB2BGR)
+                    
+                    # Perform equipment analysis
+                    analysis_results = analyzer.analyze_equipment_differences(
+                        img1_array, img2_array,
+                        uploaded_img1.name, uploaded_img2.name
+                    )
+                    
+                    # Display results
+                    st.success("✅ P&ID equipment analysis completed successfully!")
+                    
+                    # Equipment summary metrics
+                    summary = analysis_results['summary_statistics']
+                    equipment_stats = analysis_results.get('equipment_statistics', {})
+                    safety_stats = analysis_results.get('safety_statistics', {})
+                    
+                    # Main metrics row
+                    col1, col2, col3, col4, col5 = st.columns(5)
+                    with col1:
+                        st.metric("Total Equipment Differences", summary['total_differences_found'])
+                    with col2:
+                        st.metric("Equipment Items", summary['equipment_differences'])
+                    with col3:
+                        st.metric("Pipe Differences", summary['pipe_differences'])
+                    with col4:
+                        st.metric("Instrument Differences", summary['instrument_differences'])
+                    with col5:
+                        st.metric("Critical Safety Items", safety_stats.get('CRITICAL', 0))
+                    
+                    # Equipment type breakdown
+                    if equipment_stats:
+                        st.subheader("🏭 Equipment Type Distribution")
+                        eq_cols = st.columns(min(len(equipment_stats), 5))
+                        for i, (eq_type, count) in enumerate(equipment_stats.items()):
+                            with eq_cols[i % 5]:
+                                st.metric(f"{eq_type.title()}", count)
+                    
+                    # Enhanced safety alerts with equipment-specific warnings
+                    critical_count = safety_stats.get('CRITICAL', 0)
+                    high_count = safety_stats.get('HIGH', 0)
+                    
+                    if critical_count > 0:
+                        st.error(f"🚨 {critical_count} CRITICAL equipment differences detected!")
+                        st.error("⚠️ **Immediate Review Required**: These may include valve changes, safety system modifications, or critical control equipment.")
+                    elif high_count > 0:
+                        st.warning(f"⚠️ {high_count} HIGH severity equipment differences detected.")
+                        st.warning("These may include pump modifications, vessel changes, or instrument updates.")
+                    else:
+                        st.info("✅ No critical equipment safety differences detected.")
+                    
+                    # Display enhanced marked image
+                    st.subheader("🎯 P&ID with Equipment Differences Highlighted")
+                    marked_img_rgb = cv2.cvtColor(analysis_results['marked_image'], cv2.COLOR_BGR2RGB)
+                    st.image(marked_img_rgb, caption="P&ID Equipment Differences with Type Recognition", use_container_width=True)
+                    
+                    # Equipment-specific visualizations
+                    if analysis_results['all_differences']:
+                        st.subheader("📊 Equipment Analysis Visualizations")
+                        visualizations = create_equipment_visualizations(analysis_results)
+                        
+                        if visualizations:
+                            vis_col1, vis_col2 = st.columns(2)
+                            
+                            with vis_col1:
+                                if 'equipment_pie' in visualizations:
+                                    st.plotly_chart(visualizations['equipment_pie'], use_container_width=True)
+                                if 'safety_pie' in visualizations:
+                                    st.plotly_chart(visualizations['safety_pie'], use_container_width=True)
+                            
+                            with vis_col2:
+                                if 'equipment_scatter' in visualizations:
+                                    st.plotly_chart(visualizations['equipment_scatter'], use_container_width=True)
+                                if 'equipment_location_map' in visualizations:
+                                    st.plotly_chart(visualizations['equipment_location_map'], use_container_width=True)
+                    else:
+                        st.info("📊 No equipment differences found to visualize.")
+                    
+                    # Detailed equipment analysis tables
+                    st.subheader("📋 Detailed Equipment Analysis")
+                    
+                    # Tabbed interface for different equipment types
+                    tab1, tab2, tab3, tab4 = st.tabs(["All Equipment", "Major Equipment", "Piping Systems", "Instruments"])
+                    
+                    with tab1:
+                        if analysis_results['all_differences']:
+                            df_all = pd.DataFrame(analysis_results['all_differences'])
+                            st.dataframe(df_all, use_container_width=True)
+                        else:
+                            st.info("No equipment differences detected.")
+                    
+                    with tab2:
+                        if analysis_results['equipment_differences']:
+                            df_equipment = pd.DataFrame(analysis_results['equipment_differences'])
+                            st.dataframe(df_equipment, use_container_width=True)
+                        else:
+                            st.info("No major equipment differences detected.")
+                    
+                    with tab3:
+                        if analysis_results['pipe_differences']:
+                            df_pipes = pd.DataFrame(analysis_results['pipe_differences'])
+                            st.dataframe(df_pipes, use_container_width=True)
+                        else:
+                            st.info("No piping differences detected.")
+                    
+                    with tab4:
+                        if analysis_results['instrument_differences']:
+                            df_instruments = pd.DataFrame(analysis_results['instrument_differences'])
+                            st.dataframe(df_instruments, use_container_width=True)
+                        else:
+                            st.info("No instrument differences detected.")
+                    
+                    # Equipment-specific insights
+                    if equipment_stats:
+                        st.subheader("🔍 Equipment-Specific Safety Insights")
+                        
+                        for eq_type, count in equipment_stats.items():
+                            with st.expander(f"{eq_type.title()} Analysis ({count} differences)"):
+                                eq_data = [d for d in analysis_results['all_differences'] if d['Equipment_Type'] == eq_type]
+                                critical_items = [d for d in eq_data if d['Safety_Level'] in ['CRITICAL', 'HIGH']]
+                                
+                                st.write(f"**Safety Analysis**: {len(critical_items)} critical/high severity items")
+                                
+                                if eq_type == 'pump':
+                                    st.write("**Safety Considerations**: Pump changes affect process flow and pressure. Verify impeller compatibility and motor sizing.")
+                                elif eq_type == 'valve':
+                                    st.write("**Safety Considerations**: Valve modifications are CRITICAL. Verify fail-safe positions and control logic.")
+                                elif eq_type == 'vessel':
+                                    st.write("**Safety Considerations**: Vessel changes affect pressure containment. Review pressure relief sizing.")
+                                elif eq_type == 'pipe':
+                                    st.write("**Safety Considerations**: Piping changes affect flow paths. Verify pressure drop and material compatibility.")
+                                elif eq_type == 'instrument':
+                                    st.write("**Safety Considerations**: Instrument changes affect monitoring and control. Verify safety function integrity.")
+                                
+                                if eq_data:
+                                    eq_df = pd.DataFrame(eq_data)
+                                    key_cols = ['Difference_ID', 'Safety_Level', 'Confidence_Score', 'Description']
+                                    st.dataframe(eq_df[key_cols], use_container_width=True)
+                    
+                    # Enhanced download section
+                    st.subheader("💾 Download Equipment Analysis Results")
+                    
+                    download_col1, download_col2, download_col3 = st.columns(3)
+                    
+                    with download_col1:
+                        # Enhanced CSV with equipment data
+                        csv_bytes = create_equipment_csv(analysis_results)
+                        st.download_button(
+                            label="📊 Download Equipment Analysis CSV",
+                            data=csv_bytes,
+                            file_name=f"pid_equipment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with download_col2:
+                        # Enhanced marked image
+                        img_bytes = create_downloadable_marked_image(analysis_results['marked_image'])
+                        if img_bytes:
+                            st.download_button(
+                                label="🖼️ Download Marked P&ID",
+                                data=img_bytes,
+                                file_name=f"pid_equipment_marked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                mime="image/png"
+                            )
+                    
+                    with download_col3:
+                        # Equipment analysis report
+                        report_text = generate_equipment_report(analysis_results)
+                        st.download_button(
+                            label="📄 Download Equipment Report",
+                            data=report_text,
+                            file_name=f"pid_equipment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                            mime="text/plain"
+                        )
+                    
+                except Exception as e:
+                    st.error(f"❌ Error during equipment analysis: {str(e)}")
+                    logger.error(f"Equipment analysis error: {str(e)}")
+                    st.error("Please check your P&ID images and try again. Ensure both images contain recognizable equipment symbols.")
+
+def create_equipment_csv(analysis_results: Dict[str, Any]) -> bytes:
+    """
+    Create comprehensive CSV with equipment analysis
+    """
+    try:
+        all_diffs = analysis_results.get('all_differences', [])
+        summary = analysis_results['summary_statistics']
+        metadata = analysis_results['metadata']
+        equipment_stats = analysis_results.get('equipment_statistics', {})
+        safety_stats = analysis_results.get('safety_statistics', {})
+        
+        # Create DataFrame with equipment-specific columns
+        if all_diffs:
+            df = pd.DataFrame(all_diffs)
+        else:
+            df = pd.DataFrame(columns=[
+                'Difference_ID', 'Equipment_Type', 'Safety_Level', 'Confidence_Score',
+                'X_Coordinate', 'Y_Coordinate', 'Width', 'Height', 'Area_Pixels',
+                'Aspect_Ratio', 'Solidity', 'Circularity', 'Vertices', 'Perimeter',
+                'Description', 'Percentage_of_Image'
+            ])
+        
+        # Enhanced summary with equipment statistics
         summary_data = [
-            ['MISSING_ADDITIONAL_SUMMARY', '', '', '', '', '', '', '', ''],
-            ['Total_Missing_Equipment', len(missing_additional.get('missing_equipment', [])), '', '', '', '', '', '', ''],
-            ['Total_Additional_Equipment', len(missing_additional.get('additional_equipment', [])), '', '', '', '', '', '', ''],
-            ['Total_Missing_Pipes', len(missing_additional.get('missing_pipes', [])), '', '', '', '', '', '', ''],
-            ['Total_Additional_Pipes', len(missing_additional.get('additional_pipes', [])), '', '', '', '', '', '', ''],
-            ['', '', '', '', '', '', '', '', ''],
-            ['DETAILED_CHANGES', '', '', '', '', '', '', '', '']
+            ['EQUIPMENT_ANALYSIS_SUMMARY', '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['Analysis_Timestamp', metadata['analysis_timestamp'], '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['Equipment_Recognition_Enabled', metadata.get('equipment_recognition_enabled', False), '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['Total_Equipment_Differences', summary['total_differences_found'], '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['Major_Equipment', summary['equipment_differences'], '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['Piping_Systems', summary['pipe_differences'], '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['Instruments', summary['instrument_differences'], '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['EQUIPMENT_TYPE_BREAKDOWN', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '']
         ]
         
-        summary_df = pd.DataFrame(summary_data, columns=df_changes.columns)
-        final_df = pd.concat([summary_df, df_changes], ignore_index=True)
+        # Add equipment type statistics
+        for eq_type, count in equipment_stats.items():
+            summary_data.append([f'{eq_type.title()}_Count', count, '', '', '', '', '', '', '', '', '', '', '', '', '', ''])
+        
+        summary_data.extend([
+            ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['SAFETY_LEVEL_BREAKDOWN', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '']
+        ])
+        
+        # Add safety statistics
+        for level, count in safety_stats.items():
+            summary_data.append([f'{level}_Count', count, '', '', '', '', '', '', '', '', '', '', '', '', '', ''])
+        
+        summary_data.extend([
+            ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['DETAILED_EQUIPMENT_ANALYSIS', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '']
+        ])
+        
+        summary_df = pd.DataFrame(summary_data, columns=df.columns)
+        
+        # Combine summary and detailed data
+        final_df = pd.concat([summary_df, df], ignore_index=True)
         
         # Convert to CSV bytes
         csv_buffer = BytesIO()
@@ -944,233 +1067,173 @@ def create_enhanced_csv_with_missing_additional(analysis_results: Dict[str, Any]
         return csv_buffer.getvalue()
         
     except Exception as e:
-        logger.error(f"Error creating enhanced CSV: {str(e)}")
-        # Return empty CSV on error
-        empty_df = pd.DataFrame({'Error': [f'Error creating enhanced CSV: {str(e)}']})
+        logger.error(f"Error creating equipment CSV: {str(e)}")
+        empty_df = pd.DataFrame({'Error': [f'Error creating equipment CSV: {str(e)}']})
         csv_buffer = BytesIO()
         empty_df.to_csv(csv_buffer, index=False)
         return csv_buffer.getvalue()
 
-def create_enhanced_visualizations(analysis_results: Dict[str, Any]) -> Dict[str, Any]:
+def generate_equipment_report(analysis_results: Dict[str, Any]) -> str:
     """
-    Create enhanced visualizations for missing/additional equipment analysis
+    Generate comprehensive equipment analysis report
     """
     try:
-        missing_additional = analysis_results.get('missing_additional_analysis', {})
-        visualizations = {}
+        metadata = analysis_results['metadata']
+        summary = analysis_results['summary_statistics']
+        equipment_stats = analysis_results.get('equipment_statistics', {})
+        safety_stats = analysis_results.get('safety_statistics', {})
+        all_diffs = analysis_results.get('all_differences', [])
         
-        # Missing vs Additional Equipment Chart
-        categories = ['Missing Equipment', 'Additional Equipment', 'Missing Pipes', 'Additional Pipes']
-        counts = [
-            missing_additional.get('equipment_missing_count', 0),
-            missing_additional.get('equipment_additional_count', 0),
-            missing_additional.get('pipes_missing_count', 0),
-            missing_additional.get('pipes_additional_count', 0)
-        ]
+        report = f"""
+P&ID EQUIPMENT DIFFERENCE ANALYSIS REPORT
+{'='*50}
+
+ANALYSIS METADATA:
+- Analysis Date: {metadata['analysis_timestamp']}
+- Reference P&ID: {metadata['image1_path']}
+- Updated P&ID: {metadata['image2_path']}
+- Equipment Recognition: {metadata.get('equipment_recognition_enabled', False)}
+- Image Dimensions: {metadata['image_dimensions']}
+
+EQUIPMENT SUMMARY:
+- Total Equipment Differences: {summary['total_differences_found']}
+- Major Equipment Changes: {summary['equipment_differences']}
+- Piping System Changes: {summary['pipe_differences']}
+- Instrument Changes: {summary['instrument_differences']}
+- Percentage of Image Changed: {summary['percentage_changed']}%
+
+EQUIPMENT TYPE BREAKDOWN:
+{'='*30}
+"""
         
-        if sum(counts) > 0:
-            fig = px.bar(
-                x=categories, y=counts,
-                title="Missing vs Additional Equipment and Pipes",
-                color=categories,
-                color_discrete_map={
-                    'Missing Equipment': '#FF6B6B',
-                    'Additional Equipment': '#4ECDC4',
-                    'Missing Pipes': '#FFE66D',
-                    'Additional Pipes': '#95E1D3'
-                }
-            )
-            visualizations['missing_additional_bar'] = fig
+        if equipment_stats:
+            for eq_type, count in equipment_stats.items():
+                report += f"- {eq_type.title()}: {count} differences\n"
         
-        return visualizations
+        report += f"""
+
+SAFETY CLASSIFICATION:
+{'='*25}
+- CRITICAL (Immediate Action): {safety_stats.get('CRITICAL', 0)}
+- HIGH (Review Required): {safety_stats.get('HIGH', 0)}
+- MEDIUM (Monitor): {safety_stats.get('MEDIUM', 0)}
+- LOW (Document): {safety_stats.get('LOW', 0)}
+
+DETAILED EQUIPMENT ANALYSIS:
+{'='*35}
+"""
+        
+        if all_diffs:
+            for diff in all_diffs:
+                report += f"""
+Equipment ID: {diff['Difference_ID']}
+├── Type: {diff['Equipment_Type'].upper()}
+├── Safety Level: {diff['Safety_Level']}
+├── Confidence: {diff['Confidence_Score']:.3f}
+├── Location: ({diff['X_Coordinate']}, {diff['Y_Coordinate']})
+├── Dimensions: {diff['Width']} x {diff['Height']} pixels
+├── Area: {diff['Area_Pixels']} pixels
+└── Description: {diff['Description']}
+"""
+        
+        report += f"""
+
+SAFETY ASSESSMENT BY EQUIPMENT TYPE:
+{'='*40}
+"""
+        
+        for eq_type in equipment_stats.keys():
+            eq_diffs = [d for d in all_diffs if d['Equipment_Type'] == eq_type]
+            critical_count = len([d for d in eq_diffs if d['Safety_Level'] in ['CRITICAL', 'HIGH']])
+            
+            report += f"""
+{eq_type.upper()} EQUIPMENT ({len(eq_diffs)} changes):
+- Safety-Critical Items: {critical_count}
+"""
+            
+            if eq_type == 'pump':
+                report += "- Safety Impact: Process flow and pressure changes\n"
+                report += "- Review: Verify impeller compatibility and motor sizing\n"
+            elif eq_type == 'valve':
+                report += "- Safety Impact: CRITICAL - Flow control and isolation\n"
+                report += "- Review: Verify fail-safe positions and control logic\n"
+            elif eq_type == 'vessel':
+                report += "- Safety Impact: Pressure containment and process safety\n"
+                report += "- Review: Check pressure relief valve sizing\n"
+            elif eq_type == 'pipe':
+                report += "- Safety Impact: Flow paths and system integrity\n"
+                report += "- Review: Verify pressure drop and material compatibility\n"
+            elif eq_type == 'instrument':
+                report += "- Safety Impact: Monitoring and control capabilities\n"
+                report += "- Review: Verify safety function integrity (SIL ratings)\n"
+            
+            report += "\n"
+        
+        critical_equipment = [d for d in all_diffs if d['Safety_Level'] == 'CRITICAL']
+        if critical_equipment:
+            report += f"""
+CRITICAL EQUIPMENT REQUIRING IMMEDIATE ATTENTION:
+{'='*50}
+"""
+            for eq in critical_equipment:
+                report += f"- {eq['Equipment_Type'].upper()} (ID: {eq['Difference_ID']}): {eq['Description']}\n"
+        
+        report += f"""
+
+RECOMMENDATIONS:
+{'='*15}
+1. IMMEDIATE ACTIONS:
+   - Review all CRITICAL equipment changes immediately
+   - Verify that valve modifications include proper fail-safe design
+   - Confirm pressure vessel changes comply with ASME codes
+   - Update safety instrumentation function (SIF) documentation
+
+2. ENGINEERING REVIEW:
+   - Conduct HAZOP review for modified equipment
+   - Update P&ID revision control and numbering
+   - Verify equipment specifications and datasheets
+   - Check material compatibility and process conditions
+
+3. SAFETY MANAGEMENT:
+   - Update safety case documentation
+   - Review and update operating procedures
+   - Conduct pre-startup safety review (PSSR)
+   - Ensure compliance with process safety standards
+
+4. DOCUMENTATION:
+   - Update equipment database and maintenance procedures
+   - Revise emergency response procedures if needed
+   - Document all changes in management of change (MOC) system
+   - Update training materials for operators
+
+Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Analysis Tool: P&ID Equipment Difference Analyzer
+For Industrial Safety Applications
+"""
+        
+        return report
         
     except Exception as e:
-        logger.error(f"Error creating enhanced visualizations: {str(e)}")
-        return {}
+        logger.error(f"Error generating equipment report: {str(e)}")
+        return f"Error generating equipment report: {str(e)}"
 
-# Streamlit Application
-def main():
-    st.set_page_config(
-        page_title="Enhanced P&ID Equipment Difference Analyzer",
-        page_icon="🔧",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    st.title("🔧 Enhanced P&ID Equipment Difference Analyzer")
-    st.markdown("**Industrial Safety Analysis with Equipment Recognition and Missing/Additional Equipment Tracking**")
-    
-    # Sidebar configuration
-    st.sidebar.header("⚙️ Analysis Configuration")
-    sensitivity = st.sidebar.slider("Sensitivity", 10.0, 100.0, 30.0, 5.0)
-    min_area = st.sidebar.slider("Minimum Area", 50, 1000, 100, 50)
-    distance_threshold = st.sidebar.slider("Position Matching Threshold (pixels)", 20, 100, 50, 10)
-    
-    st.sidebar.markdown("### 🏭 Recognized Equipment Types")
-    st.sidebar.markdown("- **Pumps**: Centrifugal and positive displacement")
-    st.sidebar.markdown("- **Drums/Tanks**: Storage vessels")  
-    st.sidebar.markdown("- **Vessels**: Process reactors and separators")
-    st.sidebar.markdown("- **Heat Exchangers**: Shell and tube equipment")
-    st.sidebar.markdown("- **Valves**: Control and isolation (CRITICAL)")
-    st.sidebar.markdown("- **Instruments**: Monitoring and control devices")
-    st.sidebar.markdown("- **Pipes**: Process piping systems")
-    
-    # File upload
-    st.header("📁 Upload P&ID Images")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Reference P&ID (Original)")
-        uploaded_img1 = st.file_uploader("Choose reference image", type=['png', 'jpg', 'jpeg', 'tiff', 'bmp'], key="img1")
-        if uploaded_img1:
-            image1 = Image.open(uploaded_img1)
-            st.image(image1, caption="Reference P&ID", use_container_width=True)
-    
-    with col2:
-        st.subheader("Updated P&ID (Modified)")
-        uploaded_img2 = st.file_uploader("Choose updated image", type=['png', 'jpg', 'jpeg', 'tiff', 'bmp'], key="img2")
-        if uploaded_img2:
-            image2 = Image.open(uploaded_img2)
-            st.image(image2, caption="Updated P&ID", use_container_width=True)
-    
-    # Analysis
-    if uploaded_img1 and uploaded_img2:
-        st.header("🔬 Enhanced Equipment Analysis")
+def create_downloadable_marked_image(marked_image: np.ndarray) -> bytes:
+    """
+    Convert marked image to downloadable bytes
+    """
+    try:
+        # Convert BGR to RGB for PIL
+        rgb_image = cv2.cvtColor(marked_image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_image)
         
-        if st.button("🚀 Analyze Equipment Changes", type="primary"):
-            with st.spinner("Analyzing P&ID equipment changes... Detecting missing and additional equipment..."):
-                try:
-                    # Initialize analyzer
-                    analyzer = EnhancedPIDDifferenceAnalyzer(sensitivity=sensitivity, min_area=min_area)
-                    
-                    # Convert images
-                    img1_array = np.array(image1)
-                    img2_array = np.array(image2)
-                    
-                    if len(img1_array.shape) == 3:
-                        img1_array = cv2.cvtColor(img1_array, cv2.COLOR_RGB2BGR)
-                    if len(img2_array.shape) == 3:
-                        img2_array = cv2.cvtColor(img2_array, cv2.COLOR_RGB2BGR)
-                    
-                    # Perform analysis
-                    analysis_results = analyzer.analyze_equipment_differences(
-                        img1_array, img2_array, uploaded_img1.name, uploaded_img2.name
-                    )
-                    
-                    st.success("✅ Enhanced equipment analysis completed!")
-                    
-                    # Display summary
-                    missing_additional = analysis_results['missing_additional_analysis']
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Missing Equipment", missing_additional['equipment_missing_count'])
-                    with col2:
-                        st.metric("Additional Equipment", missing_additional['equipment_additional_count'])
-                    with col3:
-                        st.metric("Missing Pipes", missing_additional['pipes_missing_count'])
-                    with col4:
-                        st.metric("Additional Pipes", missing_additional['pipes_additional_count'])
-                    
-                    # Safety alerts
-                    total_changes = missing_additional['total_changes']
-                    if total_changes > 0:
-                        st.warning(f"⚠️ {total_changes} equipment/pipe changes detected! Review required.")
-                    else:
-                        st.info("✅ No equipment or pipe changes detected.")
-                    
-                    # Display marked image
-                    st.subheader("🎯 Marked Differences")
-                    marked_img_rgb = cv2.cvtColor(analysis_results['marked_image'], cv2.COLOR_BGR2RGB)
-                    st.image(marked_img_rgb, caption="P&ID with Equipment Differences Marked", use_container_width=True)
-                    
-                    # Visualizations
-                    if total_changes > 0:
-                        st.subheader("📊 Change Analysis Visualizations")
-                        visualizations = create_enhanced_visualizations(analysis_results)
-                        
-                        if 'missing_additional_bar' in visualizations:
-                            st.plotly_chart(visualizations['missing_additional_bar'], use_container_width=True)
-                    
-                    # Detailed tables
-                    st.subheader("📋 Detailed Change Analysis")
-                    
-                    tab1, tab2, tab3, tab4 = st.tabs(["Missing Equipment", "Additional Equipment", "Missing Pipes", "Additional Pipes"])
-                    
-                    with tab1:
-                        missing_equipment = missing_additional.get('missing_equipment', [])
-                        if missing_equipment:
-                            df_missing = pd.DataFrame(missing_equipment)
-                            st.dataframe(df_missing, use_container_width=True)
-                        else:
-                            st.info("No missing equipment detected.")
-                    
-                    with tab2:
-                        additional_equipment = missing_additional.get('additional_equipment', [])
-                        if additional_equipment:
-                            df_additional = pd.DataFrame(additional_equipment)
-                            st.dataframe(df_additional, use_container_width=True)
-                        else:
-                            st.info("No additional equipment detected.")
-                    
-                    with tab3:
-                        missing_pipes = missing_additional.get('missing_pipes', [])
-                        if missing_pipes:
-                            df_missing_pipes = pd.DataFrame(missing_pipes)
-                            st.dataframe(df_missing_pipes, use_container_width=True)
-                        else:
-                            st.info("No missing pipes detected.")
-                    
-                    with tab4:
-                        additional_pipes = missing_additional.get('additional_pipes', [])
-                        if additional_pipes:
-                            df_additional_pipes = pd.DataFrame(additional_pipes)
-                            st.dataframe(df_additional_pipes, use_container_width=True)
-                        else:
-                            st.info("No additional pipes detected.")
-                    
-                    # Download section
-                    st.subheader("💾 Download Enhanced Results")
-                    
-                    download_col1, download_col2, download_col3 = st.columns(3)
-                    
-                    with download_col1:
-                        # Enhanced CSV download
-                        csv_bytes = create_enhanced_csv_with_missing_additional(analysis_results)
-                        st.download_button(
-                            label="📊 Download Complete Analysis CSV",
-                            data=csv_bytes,
-                            file_name=f"enhanced_pid_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv"
-                        )
-                    
-                    with download_col2:
-                        # Enhanced marked image download
-                        img_buffer = BytesIO()
-                        marked_pil = Image.fromarray(marked_img_rgb)
-                        marked_pil.save(img_buffer, format='PNG')
-                        img_bytes = img_buffer.getvalue()
-                        
-                        st.download_button(
-                            label="🖼️ Download Marked P&ID",
-                            data=img_bytes,
-                            file_name=f"enhanced_pid_marked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                            mime="image/png"
-                        )
-                    
-                    with download_col3:
-                        # Enhanced report download
-                        report_text = generate_enhanced_missing_additional_report(analysis_results)
-                        st.download_button(
-                            label="📄 Download Equipment Change Report",
-                            data=report_text,
-                            file_name=f"equipment_change_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                            mime="text/plain"
-                        )
-                    
-                except Exception as e:
-                    st.error(f"❌ Error during analysis: {str(e)}")
-                    logger.error(f"Analysis error: {str(e)}")
+        # Save to bytes buffer
+        img_buffer = BytesIO()
+        pil_image.save(img_buffer, format='PNG')
+        return img_buffer.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Error creating downloadable image: {str(e)}")
+        return b''
 
 if __name__ == "__main__":
     main()
